@@ -1,5 +1,4 @@
 import { and, eq, inArray } from "drizzle-orm";
-import { DequeuedJob, Runner } from "liteque";
 import { workerStatsCounter } from "metrics";
 import cron from "node-cron";
 import Parser from "rss-parser";
@@ -7,12 +6,12 @@ import { buildImpersonatingTRPCClient } from "trpc";
 import { fetchWithProxy } from "utils";
 import { z } from "zod";
 
-import type { ZFeedRequestSchema } from "@karakeep/shared/queues";
+import type { ZFeedRequestSchema } from "@karakeep/shared-server";
 import { db } from "@karakeep/db";
 import { rssFeedImportsTable, rssFeedsTable } from "@karakeep/db/schema";
-import { QuotaService } from "@karakeep/shared-server";
+import { FeedQueue, QuotaService } from "@karakeep/shared-server";
 import logger from "@karakeep/shared/logger";
-import { FeedQueue } from "@karakeep/shared/queues";
+import { DequeuedJob, getQueueClient } from "@karakeep/shared/queueing";
 import { BookmarkTypes } from "@karakeep/shared/types/bookmarks";
 
 export const FeedRefreshingWorker = cron.schedule(
@@ -27,13 +26,18 @@ export const FeedRefreshingWorker = cron.schedule(
         where: eq(rssFeedsTable.enabled, true),
       })
       .then((feeds) => {
+        const currentHour = new Date();
+        currentHour.setMinutes(0, 0, 0);
+        const hourlyWindow = currentHour.toISOString();
+
         for (const feed of feeds) {
+          const idempotencyKey = `${feed.id}-${hourlyWindow}`;
           FeedQueue.enqueue(
             {
               feedId: feed.id,
             },
             {
-              idempotencyKey: feed.id,
+              idempotencyKey,
             },
           );
         }
@@ -46,9 +50,9 @@ export const FeedRefreshingWorker = cron.schedule(
 );
 
 export class FeedWorker {
-  static build() {
+  static async build() {
     logger.info("Starting feed worker ...");
-    const worker = new Runner<ZFeedRequestSchema>(
+    const worker = (await getQueueClient())!.createRunner<ZFeedRequestSchema>(
       FeedQueue,
       {
         run: run,
@@ -205,6 +209,7 @@ async function run(req: DequeuedJob<ZFeedRequestSchema>) {
       trpcClient.bookmarks.createBookmark({
         type: BookmarkTypes.LINK,
         url: item.link!,
+        source: "rss",
       }),
     ),
   );
